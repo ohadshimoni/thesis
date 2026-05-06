@@ -1,13 +1,225 @@
 \documentclass{article}
 \usepackage{graphicx} % Required for inserting images
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
 
 \title{federated typiclust}
 \author{Ohad Shimoni}
 \date{May 2026}
 
 \begin{document}
-
 \maketitle
 
+
+\section{Federated TypiClust Pipeline}
+
+We propose a federated active learning pipeline inspired by TypiClust~\cite{hacohen2022active}, but designed so that the raw data and most point-level information remain local to the clients. The pipeline is modular: standard cryptographic or federated-learning components are treated as black boxes, while our main contribution is the axis-wise sorted-value mechanism for computing an exact within-cluster $L_1$ typicality score.
+
+Assume there are $K$ clients. Client $k$ holds a private unlabeled dataset
+\[
+    \mathcal{D}_k = \{x_{k,1},\dots,x_{k,n_k}\}.
+\]
+The global dataset is
+\[
+    \mathcal{D} = \bigcup_{k=1}^K \mathcal{D}_k,
+\]
+but this dataset is never centralized.
+
+\subsection{Step 1: Shared Embedding into $\mathbb{R}^d$}
+
+The first black box provides a shared embedding function
+\[
+    f : \mathcal{X} \rightarrow \mathbb{R}^d.
+\]
+Each client applies this embedding locally:
+\[
+    z_{k,i} = f(x_{k,i}) \in \mathbb{R}^d.
+\]
+
+The important requirement is that all clients use the same embedding space. This can be implemented using a public pretrained model, federated supervised learning, or federated self-supervised learning. For example, FedAvg~\cite{mcmahan2017communication} provides a standard black-box method for learning a shared model from decentralized data, and SimCLR~\cite{chen2020simple} provides a standard contrastive method for learning image embeddings. In this work, we treat the construction of $f$ as a black box.
+
+\subsection{Step 2: Private Clustering}
+
+The second black box performs clustering in the shared embedding space. It assigns each embedded point to a cluster:
+\[
+    c(z_{k,i}) \in \{1,\dots,m\}.
+\]
+The clustering procedure is assumed to be privacy-preserving. Its output is that each client knows the cluster assignment of its own points, and the protocol can refer to the global clusters
+\[
+    C_1,\dots,C_m
+\]
+without collecting all embeddings in one central location.
+
+This step can be implemented using existing privacy-preserving distributed clustering protocols, such as privacy-preserving distributed $k$-means~\cite{vaidya2003privacy,jagannathan2005privacy}. We therefore treat private clustering as a black box.
+
+\subsection{Step 3: Federated Axis-Wise Sorted Values}
+
+For each client $k$, cluster $c$, and coordinate axis $\ell \in \{1,\dots,d\}$, client $k$ considers the local embedded coordinate values
+\[
+    V_{k,c,\ell}
+    =
+    \left\{
+    z_{k,i}^{(\ell)}
+    :
+    c(z_{k,i}) = c
+    \right\}.
+\]
+
+The client sorts these values locally:
+\[
+    \mathrm{sort}(V_{k,c,\ell}).
+\]
+
+The sorted coordinate values are then aggregated across clients so that, for every cluster $c$ and coordinate $\ell$, the global sorted list is
+\[
+    V_{c,\ell}
+    =
+    \mathrm{sort}
+    \left(
+    \bigcup_{k=1}^K V_{k,c,\ell}
+    \right).
+\]
+
+Thus, the protocol does not reveal complete embedded vectors. Instead, for each cluster, it releases only the sorted marginal coordinate values
+\[
+    \{V_{c,1},V_{c,2},\dots,V_{c,d}\}.
+\]
+
+The server sends these global sorted coordinate lists back to the clients.
+
+\paragraph{Privacy intuition.}
+The server sees the coordinate values inside each cluster, but it does not receive the full vectors
+\[
+    z_{k,i} = (z_{k,i}^{(1)},\dots,z_{k,i}^{(d)}).
+\]
+In particular, the server does not know which value on axis $1$ belongs to which value on axis $2$, and so on. Therefore, the released information is weaker than releasing all embeddings, but stronger than releasing only coarse histograms. This is the central privacy-utility tradeoff of our method.
+
+\subsection{Step 4: Exact Local Computation of $L_1$ Typicality}
+
+Each client now computes the typicality of each of its local points using the global sorted coordinate lists.
+
+For a point $z$ assigned to cluster $c$, the centralized TypiClust-style $L_1$ score is
+\[
+    S(z)
+    =
+    \sum_{z' \in C_c}
+    \|z-z'\|_1.
+\]
+
+Using the decomposition of the $L_1$ distance,
+\[
+    \|z-z'\|_1
+    =
+    \sum_{\ell=1}^d
+    |z^{(\ell)} - z'^{(\ell)}|,
+\]
+we get
+\[
+    S(z)
+    =
+    \sum_{\ell=1}^d
+    \sum_{v \in V_{c,\ell}}
+    |z^{(\ell)} - v|.
+\]
+
+Therefore, once the clients receive the global sorted lists $V_{c,\ell}$, each client can compute the exact total $L_1$ distance from its own point to all points in the same cluster, without receiving the full vectors of the other clients.
+
+A point is more typical if its total distance to the cluster is smaller. Therefore, the most typical point in cluster $c$ is
+\[
+    z_c^\star
+    =
+    \arg\min_{z \in C_c} S(z).
+\]
+
+\paragraph{Efficient computation.}
+Let
+\[
+    V_{c,\ell} = (v_1,\dots,v_n)
+\]
+be sorted increasingly. For a coordinate value $a=z^{(\ell)}$, suppose $r$ values are smaller than or equal to $a$. Then
+\[
+    \sum_{j=1}^n |a-v_j|
+    =
+    a r - \sum_{j=1}^r v_j
+    +
+    \sum_{j=r+1}^n v_j
+    -
+    a(n-r).
+\]
+Using prefix sums over the sorted list, each coordinate contribution can be computed efficiently after a binary search for $r$.
+
+\subsection{Step 5: Secure Argmin for Representative Selection}
+
+For each cluster $c$, the goal is to select the point with minimum total within-cluster $L_1$ distance:
+\[
+    z_c^\star
+    =
+    \arg\min_{z \in C_c} S(z).
+\]
+
+Each client computes its best local candidate in every cluster it participates in:
+\[
+    z_{k,c}^\star
+    =
+    \arg\min_{z \in C_c \cap \mathcal{D}_k} S(z).
+\]
+
+The clients and server then run a secure argmin protocol to select the global winner:
+\[
+    z_c^\star
+    =
+    \arg\min_k S(z_{k,c}^\star).
+\]
+
+This step can be implemented as a standard secure multi-party computation task using secure comparison circuits. General secure computation protocols such as Yao's garbled circuits~\cite{yao1982protocols} and the GMW protocol~\cite{goldreich1987play} provide black-box foundations for such secure comparison and argmin operations.
+
+The protocol reveals only the selected representative for each cluster, or the identity of the client holding it, but does not reveal the scores of all candidates.
+
+\subsection{Step 6: Labeling and Federated Nearest Neighbor}
+
+The selected representatives are sent to a labeling oracle. After labeling, each selected representative has a label:
+\[
+    (z_c^\star, y_c^\star).
+\]
+
+Unlike centralized TypiClust, we do not assume that all labeled representatives must be centralized. Instead, the labeled representatives may remain distributed across the clients that own them.
+
+For prediction, we use a federated nearest-neighbor classifier. Given a query point $x$, the query holder computes
+\[
+    z = f(x).
+\]
+The system then finds the closest labeled representative under the $L_1$ metric:
+\[
+    c^\star
+    =
+    \arg\min_c
+    \|z-z_c^\star\|_1.
+\]
+The predicted label is
+\[
+    \hat{y}(z)
+    =
+    y_{c^\star}^\star.
+\]
+
+This nearest-neighbor step can also be implemented as a secure computation black box. Existing work on privacy-preserving $k$-nearest-neighbor search and classification over encrypted or distributed data~\cite{wong2009secure,elmehdwi2014secure} shows that nearest-neighbor classification can be performed without revealing all private feature vectors or all distances.
+
+In our setting, the required operation is simpler than full $k$-NN: we only need a secure nearest-neighbor search over the labeled representatives. The protocol should reveal the final predicted label, and possibly the identity of the nearest representative, but not the full set of distances.
+
+\subsection{Pipeline Summary}
+
+The full pipeline is:
+
+\begin{enumerate}
+    \item Use a black-box shared embedding method to map every private example to $\mathbb{R}^d$.
+    \item Use a black-box private clustering method to assign every point to a cluster.
+    \item For every client, cluster, and coordinate axis, create sorted local coordinate-value lists.
+    \item Aggregate the sorted coordinate values so that the global sorted list $V_{c,\ell}$ is available for every cluster $c$ and coordinate $\ell$.
+    \item Each client computes, for every local point, the exact sum of $L_1$ distances to all points in its cluster using the global sorted coordinate lists.
+    \item For each cluster, use secure argmin to select the point with minimum total $L_1$ distance.
+    \item Label the selected representatives.
+    \item Classify future points using federated nearest neighbor over the labeled representatives.
+\end{enumerate}
 
 \end{document}
